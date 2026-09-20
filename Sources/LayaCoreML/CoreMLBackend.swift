@@ -13,12 +13,16 @@ public actor CoreMLBackend: DecisionBackend {
     private let configuration: ModelConfiguration
     private let vocabularySize: Int
     private let actionCount: Int
+    private let padTokenID: Int32
+    private let sequenceLengths: [Int]
+    private let modelOptionCount: Int
     private let temporaryCompiledURL: URL?
 
     public init(modelURL: URL, configuration: ModelConfiguration, vocabularySize: Int,
-                actionCount: Int, compute: ComputePolicy = .cpuOnly) throws {
+                actionCount: Int, padTokenID: Int32, compute: ComputePolicy = .cpuOnly) throws {
         try configuration.validate()
-        guard modelURL.isFileURL, vocabularySize > 0, actionCount > 0, actionCount <= 256 else {
+        guard modelURL.isFileURL, vocabularySize > 0, actionCount > 0, actionCount <= 256,
+              padTokenID >= 0, Int(padTokenID) < vocabularySize else {
             throw LayaError.incompatibleModel("Invalid model URL, vocabulary size, or action count.")
         }
         let compiled: URL
@@ -55,10 +59,27 @@ public actor CoreMLBackend: DecisionBackend {
                     throw LayaError.incompatibleModel("Missing model output \(name).")
                 }
             }
+            guard let sequenceConstraint = inputs["input_ids"]?.multiArrayConstraint?.shapeConstraint,
+                  let attentionConstraint = inputs["attention_mask"]?.multiArrayConstraint?.shapeConstraint else {
+                throw LayaError.incompatibleModel("Missing sequence shape constraints.")
+            }
+            let sequenceShapes = sequenceConstraint.enumeratedShapes.map { $0.map(\.intValue) }
+            let attentionShapes = attentionConstraint.enumeratedShapes.map { $0.map(\.intValue) }
+            let lengths = sequenceShapes.compactMap { $0.count == 2 && $0[0] == 1 ? $0[1] : nil }.sorted()
+            guard !lengths.isEmpty, sequenceShapes == attentionShapes,
+                  let markerShape = inputs["marker_pos"]?.multiArrayConstraint?.shape.map(\.intValue),
+                  inputs["marker_mask"]?.multiArrayConstraint?.shape.map(\.intValue) == markerShape,
+                  markerShape.count == 2, markerShape[0] == 1, markerShape[1] >= 2,
+                  inputs["qtype"]?.multiArrayConstraint?.shape.map(\.intValue) == [1] else {
+                throw LayaError.incompatibleModel("Expected enumerated sequence lengths with fixed one-row marker tensors.")
+            }
             self.model = loaded
             self.configuration = configuration
             self.vocabularySize = vocabularySize
             self.actionCount = actionCount
+            self.padTokenID = padTokenID
+            self.sequenceLengths = lengths
+            self.modelOptionCount = markerShape[1]
             self.temporaryCompiledURL = temporary
         } catch {
             if let temporary { try? FileManager.default.removeItem(at: temporary) }
@@ -75,24 +96,45 @@ public actor CoreMLBackend: DecisionBackend {
         try batch.validate()
         guard batch.batchSize <= configuration.maxQuestions,
               batch.sequenceLength <= configuration.maxLength,
-              batch.optionCount <= configuration.maxOptions,
+              batch.optionCount <= configuration.maxOptions, batch.optionCount <= modelOptionCount,
               batch.inputIDs.allSatisfy({ Int($0) < vocabularySize }) else {
             throw LayaError.invalid("Input exceeds this exported model's limits or vocabulary.")
         }
-        let sequenceShape = [batch.batchSize, batch.sequenceLength]
-        let markerShape = [batch.batchSize, batch.optionCount]
-        let tensors: [String: MLMultiArray] = [
-            "input_ids": try Self.tensor(batch.inputIDs, shape: sequenceShape),
-            "attention_mask": try Self.tensor(batch.attentionMask, shape: sequenceShape),
-            "marker_pos": try Self.tensor(batch.markerPositions, shape: markerShape),
-            "marker_mask": try Self.tensor(batch.markerMask, shape: markerShape),
-            "qtype": try Self.tensor(batch.questionTypes, shape: [batch.batchSize]),
-        ]
-        let features = try MLDictionaryFeatureProvider(dictionary: tensors.mapValues { MLFeatureValue(multiArray: $0) })
-        let prediction = try model.prediction(from: features)
-        let result = ModelOutput(
-            logits: try Self.matrix(prediction, name: "logits", rows: batch.batchSize, columns: batch.optionCount),
-            actionLogits: try Self.matrix(prediction, name: "act_logits", rows: batch.batchSize, columns: actionCount))
+        guard let paddedLength = sequenceLengths.first(where: { $0 >= batch.sequenceLength }) else {
+            throw LayaError.invalid("No exported sequence length can hold this input.")
+        }
+        var logits: [[Double]] = []
+        var actions: [[Double]] = []
+        // ponytail: one Core ML call per question; add fixed-size batch artifacts only if profiling justifies them.
+        for row in 0..<batch.batchSize {
+            try Task.checkCancellation()
+            var inputIDs = [Int32](repeating: padTokenID, count: paddedLength)
+            var attentionMask = [Int32](repeating: 0, count: paddedLength)
+            var markerPositions = [Int32](repeating: 0, count: modelOptionCount)
+            var markerMask = [Int32](repeating: 0, count: modelOptionCount)
+            let sequenceStart = row * batch.sequenceLength
+            let optionStart = row * batch.optionCount
+            inputIDs.replaceSubrange(0..<batch.sequenceLength,
+                                     with: batch.inputIDs[sequenceStart..<(sequenceStart + batch.sequenceLength)])
+            attentionMask.replaceSubrange(0..<batch.sequenceLength,
+                                          with: batch.attentionMask[sequenceStart..<(sequenceStart + batch.sequenceLength)])
+            markerPositions.replaceSubrange(0..<batch.optionCount,
+                                            with: batch.markerPositions[optionStart..<(optionStart + batch.optionCount)])
+            markerMask.replaceSubrange(0..<batch.optionCount,
+                                       with: batch.markerMask[optionStart..<(optionStart + batch.optionCount)])
+            let tensors: [String: MLMultiArray] = [
+                "input_ids": try Self.tensor(inputIDs, shape: [1, paddedLength]),
+                "attention_mask": try Self.tensor(attentionMask, shape: [1, paddedLength]),
+                "marker_pos": try Self.tensor(markerPositions, shape: [1, modelOptionCount]),
+                "marker_mask": try Self.tensor(markerMask, shape: [1, modelOptionCount]),
+                "qtype": try Self.tensor([batch.questionTypes[row]], shape: [1]),
+            ]
+            let features = try MLDictionaryFeatureProvider(dictionary: tensors.mapValues { MLFeatureValue(multiArray: $0) })
+            let prediction = try model.prediction(from: features)
+            logits.append(Array(try Self.matrix(prediction, name: "logits", rows: 1, columns: modelOptionCount)[0].prefix(batch.optionCount)))
+            actions.append(try Self.matrix(prediction, name: "act_logits", rows: 1, columns: actionCount)[0])
+        }
+        let result = ModelOutput(logits: logits, actionLogits: actions)
         try Task.checkCancellation()
         return result
     }

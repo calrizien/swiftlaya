@@ -42,7 +42,7 @@ Run `swift --version`, `swift build`, `swift test`, and build `Integrations/Hugg
 
 Start with the English checkpoint. Run `Tools/export_coreml.py` on macOS in a reproducible virtual environment. Record Python, torch, transformers, coremltools, OS, hardware, immutable model revision, and all source hashes. The script records a subset automatically; retain `pip freeze` alongside results.
 
-Do not weaken masks, remove the action head, change activations, replace attention with a causal implementation, or silently alter rotary/sliding-window behavior to make conversion pass. Trace warnings require investigation. If the exporter encounters an unsupported operation, add a narrowly equivalent export implementation with PyTorch comparisons or choose another backend. The exporter is experimental; no full checkpoint has been converted in the authoring environment.
+Do not weaken masks, remove the action head, change activations, replace attention with a causal implementation, or silently alter rotary/sliding-window behavior to make conversion pass. The exporter reuses the Apache-2.0 `laya-coreml` export graph because the Transformers graph contains unsupported tracing operators. It strictly loads the original state dictionary and compares raw outputs against upstream PyTorch across every fixture before Core ML conversion. The exporter is experimental until a full checkpoint passes both Core ML and native Swift parity.
 
 The exporter first checks eager-vs-traced tensors across multiple shapes, then PyTorch-vs-Core ML tensors. Its `coreMLVerified` marker means those exported test cases passed on CPU. It does not certify native tokenization, task accuracy, arbitrary shapes, or other compute policies.
 
@@ -68,5 +68,7 @@ Keep code and model licenses/provenance, establish a distinct Swift release proc
 - Swift 6.4 announcement: https://www.swift.org/blog/swift-6.4-released/ (September 15, 2026).
 - Core ML conversion: https://apple.github.io/coremltools/docs-guides/source/convert-pytorch-workflow.html
 - Flexible shapes: https://apple.github.io/coremltools/docs-guides/source/flexible-inputs.html
+- Core ML array shape constraints: https://developer.apple.com/documentation/CoreML/MLMultiArrayConstraint#Accessing-the-Constraints
+- Export graph: https://github.com/mizorewww/laya-coreml/blob/main/laya_coreml/torch_model.py
 - Swift tokenizer source: https://github.com/huggingface/swift-transformers/tree/9088d55148b799e853cf4e039b0f0a1e3efe034c
 - Original model card: https://huggingface.co/convaiinnovations/laya

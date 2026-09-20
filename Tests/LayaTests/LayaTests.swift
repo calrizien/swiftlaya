@@ -293,8 +293,10 @@ func detectsNonLatin(text: String, script: String) {
     #expect(decoded.questions[0].labels == ["z", "a"])
 }
 @Test func unverifiedExportsFailClosed() throws {
-    let text = #"{"formatVersion":1,"coreMLVerified":false,"vocabularySize":50000,"actionCount":2,"checkpoint":"local","sourceRevision":"local","sourceWeightSHA256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#
+    let text = #"{"formatVersion":1,"coreMLVerified":false,"vocabularySize":50000,"actionCount":2,"checkpoint":"local","sourceRevision":"local","sourceWeightSHA256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","absoluteTolerance":0.00001,"relativeTolerance":0.000001}"#
     let manifest = try JSONDecoder().decode(ExportManifest.self, from: Data(text.utf8))
+    #expect(manifest.absoluteTolerance == 0.00001)
+    #expect(manifest.relativeTolerance == 0.000001)
     #expect(throws: LayaError.self) { try manifest.validate() }
     try manifest.validate(allowUnverified: true)
 }
@@ -309,6 +311,18 @@ func detectsNonLatin(text: String, script: String) {
     #expect(try Parity.verifyTokens(fixture, tokenizer: t, configuration: c) == batch)
     try Parity.verifyOutput(output, against: fixture, configuration: c)
     #expect(throws: LayaError.self) { try Parity.verifyOutput(.init(logits: [[0, 2]], actionLogits: [[0, 0]]), against: fixture, configuration: c) }
+    let large = ModelOutput(logits: [[0, 1]], actionLogits: [[4389.991211, -3591.664551]])
+    let largeAnswers = try Postprocessor.process(large, questions: [q], configuration: c)
+    let largeEncoded = try JSONDecoder().decode(JSONValue.self, from: JSONEncoder().encode(largeAnswers))
+    let largeFixture = ParityCase(name: "large-logits", request: fixture.request, sequences: [sequence], batch: batch,
+                                  output: large, answers: largeEncoded)
+    try Parity.verifyOutput(.init(logits: [[0, 1]], actionLogits: [[4389.9883, -3591.662]]),
+                            against: largeFixture, configuration: c)
+    #expect(throws: LayaError.self) {
+        try Parity.verifyOutput(.init(logits: [[0, 1]], actionLogits: [[4389.9883, -3591.662]]),
+                                against: largeFixture, configuration: c,
+                                tolerance: 0.001, relativeTolerance: 1e-12)
+    }
     let wrong = ParityCase(name: "bad", request: .init(state: .string("changed"), questions: [q]), sequences: [sequence], batch: batch, output: output, answers: encoded)
     #expect(throws: LayaError.self) { try Parity.verifyTokens(wrong, tokenizer: t, configuration: c) }
 }

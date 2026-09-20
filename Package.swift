@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "SwiftLaya",
-    platforms: [.macOS(.v14), .iOS(.v17), .visionOS(.v1)],
+    platforms: [.macOS(.v15), .iOS(.v18), .visionOS(.v2)],
     products: [
         .library(name: "Laya", targets: ["Laya"]),
         .library(name: "LayaCoreML", targets: ["LayaCoreML"]),

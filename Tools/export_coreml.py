@@ -80,6 +80,7 @@ def main() -> None:
     import numpy as np
     import torch
     import coremltools as ct
+    from laya_coreml.torch_model import load_model as load_export_model
     sys.path.insert(0, str(ROOT))
     from laya.agent import Agent
     from laya.common import QTYPES, build_sequence, collate_items, render_options
@@ -113,6 +114,9 @@ def main() -> None:
             def forward(self, input_ids, attention_mask, marker_pos, marker_mask, qtype):
                 return self.model(input_ids.long(), attention_mask.long(), marker_pos.long(), marker_mask.bool(), qtype.long())
 
+        reference_graph = ExportGraph(agent.model).eval()
+        export_graph = load_export_model(source, max_len, attention_implementation="sdpa")
+
         def choice(count=3):
             return {"type": "choice", "instructions": "Which option best matches the state?",
                     "criteria": {f"option{i}": f"description {i}" for i in range(count)}}
@@ -145,7 +149,10 @@ def main() -> None:
                     sequences.append({"ids": ids, "markers": markers, "questionType": qt, "truncatedStateTokens": 0})
                 b = collate_items([items], agent.tok.pad_token_id)
                 example = tuple(b[n].to(torch.int32) for n in names)
-                logits, acts = ExportGraph(agent.model)(*example)
+                logits, acts = reference_graph(*example)
+                export_logits, export_acts = export_graph(*example)
+                np.testing.assert_allclose(export_logits.numpy(), logits.numpy(), atol=a.atol, rtol=0, err_msg=name)
+                np.testing.assert_allclose(export_acts.numpy(), acts.numpy(), atol=a.atol, rtol=0, err_msg=name)
                 inputs.append(example)
                 fixture = {"name": name, "request": {"state": state, "questions": [native_question(k, v) for k, v in questions.items()]},
                            "sequences": sequences,
@@ -157,22 +164,41 @@ def main() -> None:
                            "answers": agent.predict(state, questions)["answers"]}
                 fixtures.append(fixture)
 
-            graph = ExportGraph(agent.model).eval()
-            traced = torch.jit.trace(graph, inputs[3], check_trace=True, check_inputs=[inputs[1], inputs[-1]])
+            lengths = [length for length in (16, 32, 64, 96, 128, 192, 256, 384, 512, max_len) if length <= max_len]
+            lengths = sorted(set(lengths))
+
+            def padded_row(example, row, length):
+                sequence_length, option_count = example[0].shape[1], example[2].shape[1]
+                if sequence_length > length or option_count > a.max_options:
+                    raise ValueError("Fixture exceeds the fixed export shape.")
+                values = [
+                    torch.full((1, length), agent.tok.pad_token_id, dtype=torch.int32),
+                    torch.zeros((1, length), dtype=torch.int32),
+                    torch.zeros((1, a.max_options), dtype=torch.int32),
+                    torch.zeros((1, a.max_options), dtype=torch.int32),
+                    example[4][row:row + 1],
+                ]
+                values[0][0, :sequence_length] = example[0][row]
+                values[1][0, :sequence_length] = example[1][row]
+                values[2][0, :option_count] = example[2][row]
+                values[3][0, :option_count] = example[3][row]
+                return tuple(values)
+
+            trace_length = 128 if max_len >= 128 else lengths[-1]
+            trace_input = padded_row(inputs[3], 0, trace_length)
+            traced = torch.jit.trace(export_graph, trace_input, check_trace=True)
             # A successful trace alone is not dynamic-shape validation.
             for example, fixture in zip(inputs, fixtures):
                 actual = traced(*example)
                 for tensor, expected in zip(actual, [fixture["output"]["logits"], fixture["output"]["actionLogits"]]):
                     np.testing.assert_allclose(tensor.numpy(), np.asarray(expected), atol=a.atol, rtol=0)
 
-        B = ct.RangeDim(lower_bound=1, upper_bound=a.max_batch, default=inputs[3][0].shape[0], symbol="batch")
-        L = ct.RangeDim(lower_bound=1, upper_bound=max_len, default=inputs[3][0].shape[1], symbol="sequence")
-        K = ct.RangeDim(lower_bound=2, upper_bound=a.max_options, default=inputs[3][2].shape[1], symbol="options")
-        shapes = [(B, L), (B, L), (B, K), (B, K), (B,)]
+        sequence_shape = ct.EnumeratedShapes([(1, length) for length in lengths], default=(1, trace_length))
+        shapes = [sequence_shape, sequence_shape, (1, a.max_options), (1, a.max_options), (1,)]
         converted = ct.convert(traced, convert_to="mlprogram",
                                inputs=[ct.TensorType(name=n, shape=s, dtype=np.int32) for n, s in zip(names, shapes)],
                                outputs=[ct.TensorType(name="logits"), ct.TensorType(name="act_logits")],
-                               minimum_deployment_target=ct.target.iOS17,
+                               minimum_deployment_target=ct.target.iOS18,
                                compute_precision=ct.precision.FLOAT32, compute_units=ct.ComputeUnit.CPU_ONLY,
                                skip_model_load=True)
         a.output.parent.mkdir(parents=True, exist_ok=True)
@@ -184,9 +210,18 @@ def main() -> None:
             if not a.skip_coreml_verification:
                 native = ct.models.MLModel(str(destination / "model.mlpackage"), compute_units=ct.ComputeUnit.CPU_ONLY)
                 for example, fixture in zip(inputs, fixtures):
-                    actual = native.predict({n: t.numpy() for n, t in zip(names, example)})
-                    for key, expected in [("logits", fixture["output"]["logits"]), ("act_logits", fixture["output"]["actionLogits"])]:
-                        np.testing.assert_allclose(actual[key], np.asarray(expected), atol=a.atol, rtol=0, err_msg=fixture["name"])
+                    sequence_length, option_count = example[0].shape[1], example[2].shape[1]
+                    padded_length = next((length for length in lengths if length >= sequence_length), None)
+                    if padded_length is None:
+                        raise ValueError(f"{fixture['name']}: no exported sequence length can hold the input.")
+                    logits, actions = [], []
+                    for row in range(example[0].shape[0]):
+                        row_input = padded_row(example, row, padded_length)
+                        actual = native.predict({n: t.numpy() for n, t in zip(names, row_input)})
+                        logits.append(actual["logits"][0, :option_count])
+                        actions.append(actual["act_logits"][0])
+                    np.testing.assert_allclose(np.asarray(logits), np.asarray(fixture["output"]["logits"]), atol=a.atol, rtol=1e-6, err_msg=fixture["name"])
+                    np.testing.assert_allclose(np.asarray(actions), np.asarray(fixture["output"]["actionLogits"]), atol=a.atol, rtol=1e-6, err_msg=fixture["name"])
                 verified = True
             agent.tok.save_pretrained(destination / "tokenizer")
             dump(destination / "rl_agent_config.json", cfg)
@@ -200,7 +235,9 @@ def main() -> None:
                  "referenceCodeCommit": REFERENCE_COMMIT,
                  "referenceSourceSHA256": {name: file_sha256(ROOT / "laya" / name) for name in ["agent.py", "common.py"]},
                  "torchVersion": torch.__version__, "coremltoolsVersion": ct.__version__,
+                 "modelBatchSize": 1, "modelOptionCount": a.max_options, "sequenceLengths": lengths,
                  "computePrecision": "float32", "verificationComputeUnits": "cpuOnly", "absoluteTolerance": a.atol,
+                 "relativeTolerance": 1e-6,
                  "nativeSwiftParityVerified": False})
             shutil.copyfile(ROOT / "LICENSE", destination / "LICENSE")
             if a.output.exists():

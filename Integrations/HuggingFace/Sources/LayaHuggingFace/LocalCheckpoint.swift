@@ -52,20 +52,25 @@ public struct LocalCheckpoint: Sendable {
         // Keep compilation/loading off the caller's MainActor. No raw Core ML object is sent between tasks.
         let backend = try await Task.detached {
             try CoreMLBackend(modelURL: modelURL, configuration: configuration,
-                              vocabularySize: manifest.vocabularySize, actionCount: manifest.actionCount, compute: compute)
+                              vocabularySize: manifest.vocabularySize, actionCount: manifest.actionCount,
+                              padTokenID: tokens.pad, compute: compute)
         }.value
         try Task.checkCancellation()
         let agent = try Agent(tokenizer: tokenizer, backend: backend, configuration: configuration)
         return Self(configuration: configuration, manifest: manifest, tokenizer: tokenizer, backend: backend, agent: agent)
     }
-    /// Exact token/mask parity; absolute-tolerance logit/probability parity; exact winning labels.
-    public func verify(fixtures: [ParityCase], tolerance: Double = 0.001) async throws {
+    /// Exact token/mask parity; recorded-tolerance logit/probability parity; exact winning labels.
+    public func verify(fixtures: [ParityCase], tolerance: Double? = nil,
+                       relativeTolerance: Double? = nil) async throws {
         guard !fixtures.isEmpty else { throw LayaError.invalid("Empty parity suite is not validation.") }
+        let absolute = tolerance ?? manifest.absoluteTolerance ?? 0.001
+        let relative = relativeTolerance ?? manifest.relativeTolerance ?? 1e-6
         for fixture in fixtures {
             try Task.checkCancellation()
             let batch = try Parity.verifyTokens(fixture, tokenizer: tokenizer, configuration: configuration)
             let output = try await backend.predict(batch)
-            try Parity.verifyOutput(output, against: fixture, configuration: configuration, tolerance: tolerance)
+            try Parity.verifyOutput(output, against: fixture, configuration: configuration,
+                                    tolerance: absolute, relativeTolerance: relative)
         }
     }
 }

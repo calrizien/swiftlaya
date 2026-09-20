@@ -9,10 +9,14 @@ public struct ExportManifest: Sendable, Codable {
     public let checkpoint: String
     public let sourceRevision: String
     public let sourceWeightSHA256: String
+    public let absoluteTolerance: Double?
+    public let relativeTolerance: Double?
     public func validate(allowUnverified: Bool = false) throws {
         guard formatVersion == 1, vocabularySize > 0, actionCount > 0,
               actionCount <= 256, sourceWeightSHA256.count == 64,
               sourceWeightSHA256.allSatisfy({ $0.isHexDigit }),
+              absoluteTolerance.map({ $0.isFinite && $0 > 0 && $0 <= 0.01 }) ?? true,
+              relativeTolerance.map({ $0.isFinite && $0 > 0 && $0 <= 0.0001 }) ?? true,
               coreMLVerified || allowUnverified else {
             throw LayaError.incompatibleModel("Invalid or unverified export. Run conversion verification on macOS first.")
         }
@@ -49,14 +53,20 @@ public enum Parity {
         return batch
     }
     public static func verifyOutput(_ actual: ModelOutput, against fixture: ParityCase,
-                                    configuration: ModelConfiguration, tolerance: Double = 0.001) throws {
-        guard tolerance.isFinite, tolerance > 0 else { throw LayaError.invalid("Invalid parity tolerance.") }
+                                    configuration: ModelConfiguration, tolerance: Double = 0.001,
+                                    relativeTolerance: Double = 1e-6) throws {
+        guard tolerance.isFinite, tolerance > 0,
+              relativeTolerance.isFinite, relativeTolerance > 0 else {
+            throw LayaError.invalid("Invalid parity tolerance.")
+        }
         for (a, b) in [(actual.logits, fixture.output.logits), (actual.actionLogits, fixture.output.actionLogits)] {
             guard a.count == b.count else { throw LayaError.invalidOutput("Parity output row mismatch.") }
             for (ra, rb) in zip(a, b) {
                 guard ra.count == rb.count else { throw LayaError.invalidOutput("Parity output column mismatch.") }
                 for (x, y) in zip(ra, rb) {
-                    guard x.isFinite, y.isFinite, abs(x - y) <= tolerance else {
+                    let error = abs(x - y)
+                    let relativeLimit = abs(y) * relativeTolerance
+                    guard x.isFinite, y.isFinite, error <= tolerance + relativeLimit else {
                         throw LayaError.invalidOutput("Logit parity failed for \(fixture.name): \(x) vs \(y).")
                     }
                 }
