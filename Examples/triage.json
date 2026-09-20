@@ -1,0 +1,12 @@
+{
+  "state": {"message": "I was charged twice. Please refund the duplicate today."},
+  "questions": [
+    {"id": "department", "type": "choice", "instructions": "Which department should handle this request?", "criteria": [
+      {"label": "billing", "criterion": "invoices, payments, refunds"},
+      {"label": "technical", "criterion": "bugs, outages, system errors"},
+      {"label": "sales", "criterion": "pricing, new contracts"}
+    ]},
+    {"id": "urgency", "type": "score", "instructions": "How urgent is this request?", "criteria": ["not urgent", "soon", "critical deadline or blocking issue"]},
+    {"id": "refund_requested", "type": "noul", "instructions": "Does the customer ask for money back?"}
+  ]
+}

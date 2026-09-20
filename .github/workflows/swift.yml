@@ -1,0 +1,88 @@
+name: Swift 6.4
+on:
+  pull_request:
+    paths: ['Package.swift', 'Sources/**', 'Tests/**', 'Integrations/**', 'Tools/**', '.github/workflows/swift.yml']
+  push:
+    branches: [main]
+    paths: ['Package.swift', 'Sources/**', 'Tests/**', 'Integrations/**', 'Tools/**', '.github/workflows/swift.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: swift-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Import Swiftly verification key
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected='E813C892820A6FA13755B268F167DF1ACF9CE069'
+          key_file="${RUNNER_TEMP}/swift-keys.asc"
+          curl --fail --location --silent --show-error \
+            https://swift.org/keys/all-keys.asc > "$key_file"
+          gpg --batch --import "$key_file"
+          actual="$(gpg --batch --with-colons --fingerprint "$expected" \
+            | awk -F: '$1 == "fpr" { print $10; exit }')"
+          test "$actual" = "$expected"
+      - name: Install pinned Swift 6.4 snapshot on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version='6.4.x-snapshot-2026-09-17-a'
+          sudo apt-get update
+          sudo apt-get install --yes libcurl4-openssl-dev
+          swiftly_url='https://download.swift.org/swiftly/linux/swiftly-1.1.3-x86_64.tar.gz'
+          swiftly_archive="${RUNNER_TEMP}/swiftly.tar.gz"
+          swiftly_signature="${RUNNER_TEMP}/swiftly.tar.gz.sig"
+          curl --fail --location --silent --show-error "$swiftly_url" \
+            > "$swiftly_archive"
+          curl --fail --location --silent --show-error "$swiftly_url.sig" \
+            > "$swiftly_signature"
+          gpg --batch --verify "$swiftly_signature" "$swiftly_archive"
+          swiftly_root="${RUNNER_TEMP}/swiftly-bootstrap"
+          swiftly_home="${RUNNER_TEMP}/swiftly-home"
+          swiftly_bin="${RUNNER_TEMP}/swiftly-bin"
+          mkdir -p "$swiftly_root" "$swiftly_home" "$swiftly_bin"
+          tar --extract --gzip --file "$swiftly_archive" --directory "$swiftly_root"
+          export SWIFTLY_HOME_DIR="$swiftly_home"
+          export SWIFTLY_BIN_DIR="$swiftly_bin"
+          export PATH="$swiftly_bin:$PATH"
+          "$swiftly_root/swiftly" init --skip-install --quiet-shell-followup \
+            --assume-yes --no-modify-profile
+          swiftly install "$version" --use --assume-yes
+          toolchain="$(swiftly use --print-location)"
+          echo "$toolchain/usr/bin" >> "$GITHUB_PATH"
+          echo "SWIFT 6.4 toolchain: $toolchain"
+      - uses: swift-actions/setup-swift@364295d9c23900ce04d4e5cc708387921b4e50f9 # v3
+        if: runner.os == 'macOS'
+        with:
+          swift-version: '6.4.x-snapshot-2026-09-17-a'
+      - name: Require the requested compiler
+        shell: bash
+        run: |
+          swift --version
+          swift --version | grep -E 'Swift version 6\.4([. -]|$)'
+      - run: swift build
+      - run: swift test
+      - name: Build native tokenizer and Core ML integration
+        if: runner.os == 'macOS'
+        run: swift build --package-path Integrations/HuggingFace
+      - name: Exporter syntax and dependency-free utility tests
+        run: |
+          python3 -m py_compile Tools/export_coreml.py
+          python3 -m unittest discover -s Tools/tests -v
+      - name: Routing smoke test (no model)
+        run: swift run laya-route --lang de 'Der Kunde wurde zweimal belastet'
