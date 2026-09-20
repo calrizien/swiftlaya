@@ -26,6 +26,9 @@ The validated Core ML artifact uses one model row, sixteen option columns, and e
 
 ## Not established
 
+The separate [Core AI probe](COREAI_TRIAL.md) now has bounded source-runtime
+evidence. It does not extend the Core ML validation claims below.
+
 - Held-out checkpoint accuracy, calibration for Tvaily's labels, or behavioral parity with its current Jev selector.
 - GPU or Neural Engine parity, memory use, cold/warm latency, and cancellation responsiveness.
 - iOS or visionOS build and runtime execution. The validated artifact uses the iOS 18 Core ML feature level because multiple enumerated input shapes require it.
