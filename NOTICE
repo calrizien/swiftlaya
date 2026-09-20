@@ -1,0 +1,10 @@
+SwiftLaya
+
+This project includes a Swift adaptation of Laya by Nandakishor (NandhaKishorM):
+https://github.com/NandhaKishorM/laya
+
+The upstream Python reference and existing Apache License 2.0 are retained.
+SwiftLaya modifications are distributed under the same Apache License 2.0.
+Files under Sources/Laya adapt the upstream schema, packing, postprocessing,
+language routing, presets, and email utilities. The optional tokenizer library
+and converted model artifacts retain their own applicable licenses and notices.
